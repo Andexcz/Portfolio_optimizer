@@ -1,69 +1,124 @@
 import numpy as np
+import pandas as pd
+import yfinance as yf
 import cvxpy as cp
+from sklearn.covariance import LedoitWolf
+import datetime
+import warnings
 import matplotlib.pyplot as plt
 
-# ============================================================
-# STEP 1: Generate market data (6 assets for faster execution)
-# ============================================================
+warnings.filterwarnings("ignore", category=UserWarning) # Suppress warnings for clean terminal
 
-np.random.seed(42)
-assets = ['Tech', 'Finance', 'Energy', 'Healthcare', 'Consumer', 'Utilities']
-mu = np.array([0.12, 0.08, 0.09, 0.08, 0.07, 0.05])
-vols = np.array([0.25, 0.18, 0.30, 0.22, 0.19, 0.15])
+# ---------------------------------------------------------
+# 1. Live Market Data Ingestion (Global Multi-Asset)
+# ---------------------------------------------------------
+print("Fetching live market data for global portfolio (Last 6 Years)...")
 
-# Correlation matrix with sector structure
-corr = np.array([
-  [1.0, 0.4, 0.3, 0.3, 0.4, 0.2],
-  [0.4, 1.0, 0.4, 0.3, 0.3, 0.3],
-  [0.3, 0.4, 1.0, 0.2, 0.3, 0.2],
-  [0.3, 0.3, 0.2, 1.0, 0.4, 0.3],
-  [0.4, 0.3, 0.3, 0.4, 1.0, 0.4],
-  [0.2, 0.3, 0.2, 0.3, 0.4, 1.0]
-])
-Sigma = np.outer(vols, vols) * corr
-n = len(mu)
+tickers = [
+    'SPY',     # S&P 500 Proxy
+    'VT',      # Vanguard Total World (FTSE All-World Proxy)
+    'GLD',     # Gold Proxy
+    'GOOGL',   # Alphabet
+    'AMZN',    # Amazon
+    'LMT',     # Lockheed Martin
+    'META',    # Meta
+    'ASML',    # ASML
+    'NFLX',    # Netflix
+    'MC.PA',   # LVMH (Paris)
+    'MELI',    # MercadoLibre
+    'MSFT',    # Microsoft
+    'V',       # Visa
+    'SIRI',    # Sirius XM
+    'PYPL',    # PayPal
+    'TUI1.DE', # TUI AG (Frankfurt)
+    'BRK-B',   # Berkshire Hathaway Class B (Hyphen is mandatory)
+    'OR.PA',   # L'Oreal (Paris)
+    'SOFI',    # SoFi
+    'NVO',     # Novo Nordisk
+    'GRAB'     # Grab
+]
 
-# ============================================================
-# STEP 2: Portfolio optimization function
-# ============================================================
+end_date = datetime.date.today()
+start_date = end_date - datetime.timedelta(days=6*365) # Changed to 6 years
 
-def solve_portfolio(mu, Sigma, risk_aversion=1.0, max_weight=1.0, epsilon=1e-4):
-  n = len(mu)
-  Sigma_reg = (Sigma + Sigma.T) / 2 + epsilon * np.eye(n)
-  w = cp.Variable(n)
-  objective = cp.Maximize(mu @ w - risk_aversion * cp.quad_form(w, Sigma_reg))
-  constraints = [cp.sum(w) == 1, w >= 0, w <= max_weight]
-  prob = cp.Problem(objective, constraints)
-  prob.solve(solver=cp.CLARABEL)
-  if w.value is None:
-      weights = np.ones(n) / n
-  else:
-      weights = np.array(w.value).flatten()
-  port_return = float(np.dot(mu, weights))
-  port_vol = float(np.sqrt(np.dot(weights, np.dot(Sigma, weights))))
-  return {'weights': weights, 'return': port_return, 'volatility': port_vol,
-          'sharpe': port_return / port_vol if port_vol > 0 else 0}
+# Download the Close prices
+raw_data = yf.download(tickers, start=start_date, end=end_date)['Close']
 
-# ============================================================
-# STEP 3: Run analysis
-# ============================================================
+# THE QUANT FIX: Force the DataFrame columns to match our original list order
+raw_data = raw_data[tickers]
 
-print("=" * 60)
-print("PORTFOLIO OPTIMIZATION ANALYSIS")
-print("=" * 60)
+# Forward-fill missing prices due to global timezone/holiday mismatches
+data = raw_data.ffill().dropna()
 
-# Asset characteristics
-print("\nASSET CHARACTERISTICS")
-print("-" * 45)
-print(f"{'Asset':<12} {'Return':<10} {'Vol':<10} {'Sharpe':<8}")
-print("-" * 45)
-for i, name in enumerate(assets):
-  print(f"{name:<12} {mu[i]*100:>6.1f}%    {vols[i]*100:>6.1f}%   {mu[i]/vols[i]:>6.2f}")
+# Calculate daily returns
+daily_returns = data.pct_change().dropna()
 
-# Compare strategies
-print("\n" + "=" * 60)
-print("STRATEGY COMPARISON")
-print("=" * 60)
+# ---------------------------------------------------------
+# 2. Parameter Estimation (Annualized)
+# ---------------------------------------------------------
+TRADING_DAYS = 252
+
+# Expected Returns & Covariance for the overall in-sample period
+mu_daily = daily_returns.mean().values
+mu = mu_daily * TRADING_DAYS
+
+lw = LedoitWolf().fit(daily_returns)
+Sigma = lw.covariance_ * TRADING_DAYS
+
+print(f"Data ingested successfully. Analyzed {len(daily_returns)} trading days.")
+
+# ---------------------------------------------------------
+# 3. Production Portfolio Optimizer
+# ---------------------------------------------------------
+def solve_portfolio(mu, Sigma, w_current=None, risk_aversion=1.0, max_weight=1.0, tc_bps=10, rf_rate=0.04, epsilon=1e-5):
+    n = len(mu)
+    Sigma_reg = (Sigma + Sigma.T) / 2 + epsilon * np.eye(n)
+    w = cp.Variable(n)
+    
+    utility = mu @ w - risk_aversion * cp.quad_form(w, Sigma_reg)
+    
+    if w_current is None:
+        w_current = np.zeros(n)
+    
+    tc_cost = (tc_bps / 10000) * cp.norm(w - w_current, 1)
+    
+    objective = cp.Maximize(utility - tc_cost)
+    constraints = [cp.sum(w) == 1, w >= 0, w <= max_weight]
+    prob = cp.Problem(objective, constraints)
+    
+    try:
+        prob.solve(solver=cp.CLARABEL)
+    except cp.error.SolverError:
+        prob.solve(solver=cp.SCS)
+        
+    if w.value is None:
+        weights = np.ones(n) / n
+    else:
+        weights = np.clip(np.array(w.value).flatten(), 0, 1)
+        weights /= weights.sum()
+        
+    port_return = float(np.dot(mu, weights))
+    port_vol = float(np.sqrt(np.dot(weights, np.dot(Sigma, weights))))
+    sharpe = (port_return - rf_rate) / port_vol if port_vol > 0 else 0
+    
+    return {
+        'weights': weights, 
+        'return': port_return, 
+        'volatility': port_vol,
+        'sharpe': sharpe,
+        'turnover': float(np.sum(np.abs(weights - w_current)))
+    }
+
+# ---------------------------------------------------------
+# 4. In-Sample Execution, Analysis & Visualization
+# ---------------------------------------------------------
+print("\n" + "=" * 70)
+print("IN-SAMPLE MVO DASHBOARD (6-Year Lookback)")
+print("=" * 70)
+
+live_rf_rate = 0.041 
+current_portfolio = np.ones(len(tickers)) / len(tickers)
+
 strategies = [
   ('Aggressive (λ=0.5)', 0.5, 1.0),
   ('Balanced (λ=2.0)', 2.0, 1.0),
@@ -72,74 +127,255 @@ strategies = [
 ]
 
 results = {}
-print(f"{'Strategy':<22} {'Return':<9} {'Vol':<9} {'Sharpe':<8}")
-print("-" * 50)
+
 for name, lam, max_w in strategies:
-  r = solve_portfolio(mu, Sigma, risk_aversion=lam, max_weight=max_w)
-  results[name] = r
-  print(f"{name:<22} {r['return']*100:>5.1f}%    {r['volatility']*100:>5.1f}%   {r['sharpe']:>6.2f}")
+    r = solve_portfolio(
+        mu, Sigma, 
+        w_current=current_portfolio, 
+        risk_aversion=lam, 
+        max_weight=max_w,
+        tc_bps=15, 
+        rf_rate=live_rf_rate
+    )
+    results[name] = r
 
-# Constraint cost analysis
-print("\n" + "=" * 60)
-print("CONSTRAINT COST ANALYSIS")
-print("=" * 60)
-base = solve_portfolio(mu, Sigma, risk_aversion=2.0, max_weight=1.0)
-print(f"Unconstrained Sharpe: {base['sharpe']:.3f}")
-print(f"\n{'Max Weight':<12} {'Sharpe':<10} {'Cost':<10}")
-print("-" * 35)
-for limit in [0.50, 0.30, 0.20, 0.15]:
-  r = solve_portfolio(mu, Sigma, risk_aversion=2.0, max_weight=limit)
-  cost = (base['sharpe'] - r['sharpe']) / base['sharpe'] * 100
-  print(f"{limit*100:>5.0f}%       {r['sharpe']:>6.3f}     {cost:>5.1f}%")
+def build_frontier(mu, Sigma, max_weight=1.0, n_pts=40):
+    returns, volatilities = [], []
+    n = len(mu)
+    Sigma_reg = (Sigma + Sigma.T) / 2 + 1e-5 * np.eye(n)
+    
+    min_target = max(0.0, np.mean(mu)) 
+    max_target = np.max(mu)
+    
+    for target in np.linspace(min_target, max_target, n_pts):
+        w = cp.Variable(n)
+        prob = cp.Problem(cp.Minimize(cp.quad_form(w, Sigma_reg)),
+                          [cp.sum(w) == 1, w >= 0, w <= max_weight, mu @ w >= target])
+        try:
+            prob.solve(solver=cp.CLARABEL)
+            if prob.status in ['optimal', 'optimal_inaccurate'] and w.value is not None:
+                returns.append(float(mu @ w.value))
+                volatilities.append(float(np.sqrt(w.value @ Sigma @ w.value)))
+        except cp.error.SolverError:
+            pass 
+            
+    return np.array(volatilities), np.array(returns)
 
-# ============================================================
-# STEP 4: Visualization
-# ============================================================
+print("Calculating Efficient Frontiers...")
+vol_unc, ret_unc = build_frontier(mu, Sigma, max_weight=1.0)
+vol_con, ret_con = build_frontier(mu, Sigma, max_weight=0.25)
 
-fig, ax = plt.subplots(figsize=(10, 7))
+ticker_to_category = {
+    'SPY': 'Macro & Indices', 'VT': 'Macro & Indices', 'GLD': 'Macro & Indices',
+    'GOOGL': 'Big Tech & Growth', 'MSFT': 'Big Tech & Growth', 'META': 'Big Tech & Growth', 
+    'ASML': 'Big Tech & Growth', 'NFLX': 'Big Tech & Growth', 'CSGP': 'Big Tech & Growth',
+    'AMZN': 'Consumer & Travel', 'MC.PA': 'Consumer & Travel', 'OR.PA': 'Consumer & Travel', 
+    'MELI': 'Consumer & Travel', 'TUI1.DE': 'Consumer & Travel',
+    'V': 'Financials & Payments', 'PYPL': 'Financials & Payments', 'SOFI': 'Financials & Payments', 'BRK-B': 'Financials & Payments',
+    'LMT': 'Defensive & Other', 'NVO': 'Defensive & Other', 'SIRI': 'Defensive & Other', 'GRAB': 'Defensive & Other'
+}
 
-# Build efficient frontier
-def build_frontier(mu, Sigma, max_weight=1.0, n_pts=30):
-  returns, volatilities = [], []
-  Sigma_reg = (Sigma + Sigma.T) / 2 + 1e-4 * np.eye(len(mu))
-  for target in np.linspace(min(mu)*0.6, max(mu)*0.95, n_pts):
-      w = cp.Variable(len(mu))
-      prob = cp.Problem(cp.Minimize(cp.quad_form(w, Sigma_reg)),
-                       [cp.sum(w) == 1, w >= 0, w <= max_weight, mu @ w >= target])
-      prob.solve(solver=cp.CLARABEL)
-      if prob.status == 'optimal':
-          returns.append(float(mu @ w.value))
-          volatilities.append(float(np.sqrt(w.value @ Sigma @ w.value)))
-  return np.array(returns), np.array(volatilities)
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7), gridspec_kw={'width_ratios': [1.2, 1]})
 
-ret_unc, vol_unc = build_frontier(mu, Sigma, max_weight=1.0)
-ret_con, vol_con = build_frontier(mu, Sigma, max_weight=0.25)
+if len(vol_unc) > 0:
+    ax1.plot(vol_unc * 100, ret_unc * 100, 'k--', linewidth=2, alpha=0.6, label='Frontier (Unconstrained)')
+if len(vol_con) > 0:
+    ax1.plot(vol_con * 100, ret_con * 100, 'gray', linestyle='-.', linewidth=2, alpha=0.8, label='Frontier (25% Cap)')
 
-ax.plot(vol_unc * 100, ret_unc * 100, 'b-', linewidth=2.5, label='Unconstrained Frontier')
-ax.plot(vol_con * 100, ret_con * 100, 'g--', linewidth=2.5, label='25% Cap Frontier')
+vols_annual = np.sqrt(np.diag(Sigma))
+ax1.scatter(vols_annual * 100, mu * 100, color='gray', s=50, alpha=0.4, label='Individual Assets')
 
-# Plot assets
-ax.scatter(vols * 100, mu * 100, c='gray', s=100, alpha=0.8, zorder=5, edgecolors='white')
-for i, name in enumerate(assets):
-  ax.annotate(name, (vols[i]*100 + 0.3, mu[i]*100), fontsize=9)
+key_tickers = ['SPY', 'GLD', 'MSFT', 'NVO', 'META', 'BRK-B', 'PYPL']
+for i, ticker in enumerate(tickers):
+    if ticker in key_tickers:
+        ax1.annotate(ticker, (vols_annual[i] * 100 + 0.5, mu[i] * 100), fontsize=9, alpha=0.8, fontweight='bold')
 
-# Plot strategy portfolios
-markers = {'Aggressive (λ=0.5)': ('red', 'o'), 'Balanced (λ=2.0)': ('blue', 's'),
-         'Conservative (λ=5.0)': ('green', '^'), 'Diversified (25% cap)': ('purple', 'D')}
-for name, (color, marker) in markers.items():
-  r = results[name]
-  ax.scatter(r['volatility']*100, r['return']*100, c=color, s=180,
-             marker=marker, zorder=10, label=name, edgecolors='white', linewidth=1.5)
+colors = ['red', 'blue', 'green', 'purple']
+markers = ['o', 's', '^', 'D']
+for (name, r), color, marker in zip(results.items(), colors, markers):
+    ax1.scatter(r['volatility'] * 100, r['return'] * 100, color=color, s=200, marker=marker, 
+                edgecolors='black', linewidth=1.5, label=name, zorder=10)
 
-ax.set_xlabel('Volatility (%)', fontsize=12, fontweight='bold')
-ax.set_ylabel('Expected Return (%)', fontsize=12, fontweight='bold')
-ax.set_title('Efficient Frontier with Strategy Portfolios', fontsize=14, fontweight='bold')
-ax.legend(loc='lower right', fontsize=9)
-ax.grid(True, alpha=0.3)
+ax1.set_title('Efficient Frontier & Strategy Portfolios (6 Years)', fontweight='bold', fontsize=14)
+ax1.set_xlabel('Annualized Volatility (%)', fontsize=11)
+ax1.set_ylabel('Annualized Expected Return (%)', fontsize=11)
+ax1.legend(loc='lower right', fontsize=10, framealpha=0.9)
+ax1.grid(True, linestyle='--', alpha=0.5)
+
+names = list(results.keys())
+weights_matrix = np.array([results[name]['weights'] for name in names])
+
+unique_categories = list(dict.fromkeys(ticker_to_category.values())) 
+grouped_weights = {cat: np.zeros(len(names)) for cat in unique_categories}
+
+for i, ticker in enumerate(tickers):
+    cat = ticker_to_category[ticker]
+    grouped_weights[cat] += weights_matrix[:, i] * 100
+
+bottom = np.zeros(len(names))
+cat_colors = plt.cm.Set2(np.linspace(0, 1, len(unique_categories)))
+
+for i, cat in enumerate(unique_categories):
+    ax2.bar(names, grouped_weights[cat], bottom=bottom, color=cat_colors[i], label=cat, edgecolor='white', width=0.6)
+    bottom += grouped_weights[cat]
+
+ax2.set_title('Capital Allocation by Macro Category', fontweight='bold', fontsize=14)
+ax2.set_ylabel('Weight (%)', fontsize=11)
+ax2.tick_params(axis='x', rotation=15)
+ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+
+plt.tight_layout()
+plt.show(block=False) # Plot without stopping the backtester
+plt.pause(2)
+
+# ---------------------------------------------------------
+# 5. Out-of-Sample Walk-Forward Backtest (MVO vs. Risk Parity)
+# ---------------------------------------------------------
+print("\n" + "=" * 70)
+print("INITIALIZING WALK-FORWARD BACKTEST (6-Year Data)")
+print("=" * 70)
+
+LOOKBACK_DAYS = 252      # 1 year of training data
+REBALANCE_DAYS = 21      # 1 month holding period
+TC_BPS = 15              
+RF_RATE = 0.041          
+
+n_days, n_assets = daily_returns.shape
+dates = daily_returns.index
+
+bt_returns_div = [] 
+bt_returns_rp = []  
+bt_returns_ew = []  
+bt_dates = []
+
+w_current_div = np.ones(n_assets) / n_assets
+w_current_rp = np.ones(n_assets) / n_assets
+w_ew = np.ones(n_assets) / n_assets
+
+print(f"Running 5-Year Out-of-Sample Backtest from {dates[LOOKBACK_DAYS].date()} to {dates[-1].date()}...")
+print("Rebalancing every 21 days. Let the battle begin...")
+
+for t in range(LOOKBACK_DAYS, n_days, REBALANCE_DAYS):
+    train_data = daily_returns.iloc[t - LOOKBACK_DAYS : t]
+    end_t = min(t + REBALANCE_DAYS, n_days)
+    test_data = daily_returns.iloc[t : end_t]
+    
+    mu_train = train_data.mean().values * 252
+    
+    try:
+        lw_train = LedoitWolf().fit(train_data)
+        Sigma_train = lw_train.covariance_ * 252
+    except:
+        Sigma_train = train_data.cov().values * 252 
+        
+    # --- STRATEGY 1: Diversified MVO ---
+    opt_res = solve_portfolio(
+        mu_train, Sigma_train, 
+        w_current=w_current_div, 
+        risk_aversion=2.0, max_weight=0.25, tc_bps=TC_BPS, rf_rate=RF_RATE
+    )
+    w_target_div = opt_res['weights']
+    
+    # --- STRATEGY 2: THE OPPONENT (Inverse Volatility / Risk Parity) ---
+    volatilities = np.sqrt(np.diag(Sigma_train))
+    inv_vol = 1.0 / volatilities
+    w_target_rp = inv_vol / np.sum(inv_vol) 
+    
+    tc_div = (TC_BPS / 10000) * np.sum(np.abs(w_target_div - w_current_div))
+    tc_rp = (TC_BPS / 10000) * np.sum(np.abs(w_target_rp - w_current_rp))
+    
+    period_rets_div = test_data.dot(w_target_div).values
+    period_rets_rp = test_data.dot(w_target_rp).values
+    period_rets_ew = test_data.dot(w_ew).values
+    
+    if len(period_rets_div) > 0:
+        period_rets_div[0] -= tc_div
+        period_rets_rp[0] -= tc_rp
+        tc_ew = (TC_BPS / 10000) * np.sum(np.abs(w_ew - w_current_div)) 
+        period_rets_ew[0] -= tc_ew
+        
+    bt_returns_div.extend(period_rets_div)
+    bt_returns_rp.extend(period_rets_rp)
+    bt_returns_ew.extend(period_rets_ew)
+    bt_dates.extend(test_data.index)
+    
+    w_current_div = w_target_div
+    w_current_rp = w_target_rp
+
+print("Backtest complete! Generating performance metrics...")
+
+strat_returns = pd.Series(bt_returns_div, index=bt_dates)
+rp_returns = pd.Series(bt_returns_rp, index=bt_dates)
+ew_returns = pd.Series(bt_returns_ew, index=bt_dates)
+
+spy_idx = tickers.index('SPY')
+spy_returns = daily_returns.iloc[LOOKBACK_DAYS:, spy_idx]
+
+eq_strat = (1 + strat_returns).cumprod()
+eq_rp = (1 + rp_returns).cumprod()
+eq_ew = (1 + ew_returns).cumprod()
+eq_spy = (1 + spy_returns).cumprod()
+
+def calc_mdd(cum_returns):
+    rolling_max = cum_returns.cummax()
+    drawdown = cum_returns / rolling_max - 1.0
+    return drawdown.min()
+
+sharpe_strat = np.sqrt(252) * (strat_returns.mean() / strat_returns.std())
+sharpe_rp = np.sqrt(252) * (rp_returns.mean() / rp_returns.std())
+sharpe_ew = np.sqrt(252) * (ew_returns.mean() / ew_returns.std())
+sharpe_spy = np.sqrt(252) * (spy_returns.mean() / spy_returns.std())
+
+print("\n" + "-" * 75)
+print("OUT-OF-SAMPLE PERFORMANCE (Post-Fees)")
+print("-" * 75)
+print(f"{'Metric':<18} | {'Div MVO':<12} | {'Risk Parity':<12} | {'Equal Wt':<10} | {'SPY':<10}")
+print("-" * 75)
+print(f"{'Total Return':<18} | {(eq_strat.iloc[-1]-1)*100:>11.1f}% | {(eq_rp.iloc[-1]-1)*100:>11.1f}% | {(eq_ew.iloc[-1]-1)*100:>9.1f}% | {(eq_spy.iloc[-1]-1)*100:>9.1f}%")
+print(f"{'Max Drawdown':<18} | {calc_mdd(eq_strat)*100:>11.1f}% | {calc_mdd(eq_rp)*100:>11.1f}% | {calc_mdd(eq_ew)*100:>9.1f}% | {calc_mdd(eq_spy)*100:>9.1f}%")
+print(f"{'OOS Sharpe Ratio':<18} | {sharpe_strat:>11.2f}  | {sharpe_rp:>11.2f}  | {sharpe_ew:>9.2f}  | {sharpe_spy:>9.2f}")
+
+plt.figure(figsize=(14, 7))
+plt.plot(eq_strat.index, eq_strat, label=f'Diversified MVO (25% Cap)', color='purple', linewidth=2.5)
+plt.plot(eq_rp.index, eq_rp, label='The Opponent: Risk Parity', color='orange', linewidth=2.5)
+plt.plot(eq_ew.index, eq_ew, label='Equal Weight Benchmark', color='gray', linestyle='--', alpha=0.7)
+plt.plot(eq_spy.index, eq_spy, label='SPY (S&P 500)', color='blue', linestyle=':', alpha=0.7)
+
+plt.title('Out-of-Sample Walk-Forward Backtest (MVO vs. Risk Parity)', fontweight='bold', fontsize=15)
+plt.ylabel('Cumulative Growth ($1 Invested)', fontsize=12)
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.legend(loc='upper left', fontsize=11)
 plt.tight_layout()
 plt.show()
 
-print("\n" + "=" * 60)
-print("RECOMMENDATION: Balanced strategy with 25% position cap")
-print("=" * 60)
-print("Sharpe cost of constraints: ~5-8% (acceptable for robustness)")
+# ---------------------------------------------------------
+# 6. Current Target Allocations (For Execution)
+# ---------------------------------------------------------
+print("\n" + "=" * 55)
+print("CURRENT TARGET ALLOCATIONS (Execute Today)")
+print("=" * 55)
+
+# Extract the latest MVO weights from our In-Sample results (Section 4)
+latest_mvo_weights = results['Diversified (25% cap)']['weights']
+
+# Calculate the latest Risk Parity weights using the full 6-year covariance
+latest_volatilities = np.sqrt(np.diag(Sigma))
+latest_inv_vol = 1.0 / latest_volatilities
+latest_rp_weights = latest_inv_vol / np.sum(latest_inv_vol)
+
+print(f"{'Ticker':<10} | {'Macro Category':<22} | {'Div MVO':<10} | {'Risk Parity':<12}")
+print("-" * 65)
+
+for i, ticker in enumerate(tickers):
+    # Only print if the weight is meaningful (greater than 0.05%) to avoid clutter
+    mvo_w = latest_mvo_weights[i] * 100
+    rp_w = latest_rp_weights[i] * 100
+    cat = ticker_to_category[ticker]
+    
+    # Format with a clean zero for empty MVO slots
+    mvo_str = f"{mvo_w:>8.1f}%" if mvo_w > 0.1 else f"{'0.0%':>9}"
+    
+    print(f"{ticker:<10} | {cat:<22} | {mvo_str} | {rp_w:>9.1f}%")
+
+print("-" * 65)
+print(f"{'TOTAL':<10} | {'':<22} | {np.sum(latest_mvo_weights)*100:>8.0f}% | {np.sum(latest_rp_weights)*100:>9.0f}%")
