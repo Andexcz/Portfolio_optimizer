@@ -31,6 +31,7 @@ Při pohledu na výsledky backtestu je vidět, že za posledních 10 let tento m
 To je sice hezké, protože jsem ani nečekal, že základní kód porazí trh. Je to však dokonalá ukázka toho, jak fungují risk limity a diverzifikace v praxi, což jsem se chtěl vlastně naučit. Index S&P 500 se v posledních letech stal de facto "technologickým" (bráno s rezervou) fondem s obrovskou koncentrací v pár největších firmách. Můj model dodržoval 25% limit na sektor. Když technologie prudce rostly, můj model nemohl přelít všechen kapitál do technologických firem, ale musel alokovat kapitál i do defenzivnějších, pomaleji rostoucích sektorů.
 
 **Zajímavé zjištění (Krize 2022):**
-Síla modelu se ukazuje hlavně v krizových obdobích, jako byl rok 2022. Zatímco index SP500 zaznamenal výrazný propad, MVO model včas identifikoval změnu volatility a rotoval kapitál do energetiky (XLE) a utilit (XLU). Tím propad portfolia výrazně vyhladil a ochránil kapitál.
+Síla modelu se ukazuje hlavně v krizových obdobích, jako byl rok 2022. Zatímco index SP500 zaznamenal výrazný propad, MVO model včas identifikoval změnu volatility a rotoval kapitál do energetiky (XLE) a utilit (XLU). Tím propad portfolia výrazně vyhladil a ochránil kapitál. Bohužel v roce 2025 toto nezafungovalo (možná se k tomu ještě dostanu, přidat tam případně více safe heaven možností jako T-bills nebo zlato)
 
-Kdybych limit 25 % odstranil a snížil averzi k riziku, SPY pravděpodobně hrubou silou překonám, ale zničím tím původní myšlenku stabilního a bezpečně diverzifikovaného portfolia s nižším drawdownem, než mělo SP500.
+Kdybych limit 25 % odstranil a snížil averzi k riziku, SPY pravděpodobně hrubou silou překonám, ale zničím tím původní myšlenku stabilního a bezpečně diverzifikovaného portfolia s nižším drawdownem, 
+než mělo SP500.
